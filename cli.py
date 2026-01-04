@@ -13,6 +13,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 from src.pipeline import CourtFinderPipeline, save_geojson
 from src.cache import ResultCache
+from src.geo_utils import get_current_location
 
 # Setup logging
 logging.basicConfig(
@@ -99,6 +100,95 @@ def search(
         console.print()
         console.print("[dim]View results at: https://geojson.io[/dim]")
         
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        logger.exception("Search failed")
+        raise typer.Exit(1)
+
+
+@app.command()
+def here(
+    radius: float = typer.Option(5.0, "--radius", "-r", help="Search radius in miles"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output GeoJSON file"),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Skip cache and reprocess"),
+    mock: bool = typer.Option(False, "--mock", help="Use mock segmenter (for testing without SAM 3)")
+):
+    """
+    Search for tennis courts near your current location.
+    
+    Auto-detects your location using IP geolocation.
+    
+    Example:
+        python cli.py here --radius 5 --output nearby_courts.geojson
+    """
+    console.print(f"[bold]🎾 Court Finder - Search Near Me[/bold]")
+    
+    try:
+        # Get current location
+        console.print("[dim]📍 Detecting your location...[/dim]")
+        lat, lon, location_name = get_current_location()
+        console.print(f"[green]✓ Located: {location_name}[/green]")
+        console.print(f"[dim]  Coordinates: ({lat:.4f}, {lon:.4f})[/dim]")
+        console.print(f"Searching: {radius} mile radius")
+        
+        # Default output path
+        if output is None:
+            safe_name = location_name.replace(" ", "_").replace(",", "").lower()[:20]
+            output = Path(f"courts_{safe_name}_{radius}mi.geojson")
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+            expand=True
+        ) as progress:
+            # Initialize pipeline
+            init_task = progress.add_task("Initializing...", total=None)
+            pipeline = CourtFinderPipeline(use_mock_segmenter=mock)
+            
+            # Search task
+            search_task = progress.add_task("Starting search...", total=100)
+            progress.remove_task(init_task)
+            
+            def progress_callback(desc: str, frac: float, current: Optional[int] = None, total: Optional[int] = None):
+                progress.update(search_task, description=desc, completed=frac * 100)
+                if current is not None and total is not None:
+                    progress.update(search_task, description=f"{desc} ({current}/{total})")
+            
+            # Run search by location
+            geojson = pipeline.search_by_location(
+                lat=lat,
+                lon=lon,
+                radius_miles=radius,
+                location_name=location_name,
+                skip_cache=no_cache,
+                progress_callback=progress_callback
+            )
+        
+        # Save results
+        save_geojson(geojson, output)
+        
+        # Display summary
+        court_count = geojson["properties"]["court_count"]
+        from_cache = geojson["properties"].get("from_cache", False)
+        
+        console.print()
+        console.print(f"[green]✓ Found {court_count} tennis courts near {location_name}[/green]")
+        if from_cache:
+            console.print("[dim]  (from cache)[/dim]")
+        console.print(f"[blue]→ Output: {output}[/blue]")
+        console.print()
+        console.print("[dim]View results at: https://geojson.io[/dim]")
+        
+    except RuntimeError as e:
+        console.print(f"[red]Location error: {e}[/red]")
+        console.print("[dim]Try using 'search --zipcode' instead[/dim]")
+        raise typer.Exit(1)
     except ValueError as e:
         console.print(f"[red]Error: {e}[/red]")
         raise typer.Exit(1)

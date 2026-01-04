@@ -1,11 +1,50 @@
 """Geospatial utilities for coordinate conversion and bounding box generation."""
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Optional
 import math
+import logging
 
+import requests
 import pgeocode
 from pyproj import CRS, Transformer
+
+logger = logging.getLogger(__name__)
+
+
+def get_current_location() -> Tuple[float, float, str]:
+    """
+    Get current location based on IP address.
+    
+    Uses free ip-api.com service for geolocation.
+    
+    Returns:
+        Tuple of (latitude, longitude, location_name)
+        
+    Raises:
+        RuntimeError: If location cannot be determined
+    """
+    try:
+        # Use ip-api.com (free, no API key required, 45 req/min limit)
+        response = requests.get(
+            "http://ip-api.com/json/",
+            params={"fields": "status,message,city,regionName,lat,lon"},
+            timeout=10
+        )
+        data = response.json()
+        
+        if data.get("status") != "success":
+            raise RuntimeError(f"Geolocation failed: {data.get('message', 'Unknown error')}")
+        
+        lat = float(data["lat"])
+        lon = float(data["lon"])
+        location_name = f"{data.get('city', 'Unknown')}, {data.get('regionName', '')}"
+        
+        logger.info(f"Detected location: {location_name} ({lat:.4f}, {lon:.4f})")
+        return (lat, lon, location_name)
+        
+    except requests.RequestException as e:
+        raise RuntimeError(f"Failed to get location: {e}")
 
 
 @dataclass

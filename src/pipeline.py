@@ -9,7 +9,7 @@ import logging
 
 from shapely.geometry import mapping
 
-from .geo_utils import BBox, zipcode_to_center, create_search_bbox
+from .geo_utils import BBox, zipcode_to_center, create_search_bbox, get_current_location
 from .naip_fetcher import NAIPFetcher, NAIPImage
 from .tiling import ChipGenerator, Chip
 from .segmentation import SAM3Segmenter, MockSAM3Segmenter, SegmentationResult
@@ -224,6 +224,211 @@ class CourtFinderPipeline:
         return self._detections_to_geojson(
             detections, zipcode, radius_miles, imagery_date
         )
+    
+    def search_by_location(
+        self,
+        lat: float,
+        lon: float,
+        radius_miles: float,
+        location_name: str = "Current Location",
+        skip_cache: bool = False,
+        text_prompt: str = "tennis court",
+        progress_callback: Optional[Callable[[str, float, Optional[int], Optional[int]], None]] = None
+    ) -> Dict[str, Any]:
+        """
+        Search for tennis courts around a specific lat/lon coordinate.
+        
+        Args:
+            lat: Latitude of search center
+            lon: Longitude of search center
+            radius_miles: Search radius in miles
+            location_name: Human-readable location name for display
+            skip_cache: If True, bypass cache and reprocess
+            text_prompt: Text prompt for SAM 3 segmentation
+            progress_callback: Callable for progress updates
+            
+        Returns:
+            GeoJSON FeatureCollection of detected courts
+        """
+        def _update_progress(desc: str, frac: float = 0.0, current: int = 0, total: int = 0):
+            if progress_callback:
+                progress_callback(desc, frac, current, total)
+        
+        logger.info(f"Searching for tennis courts at ({lat:.4f}, {lon:.4f}), {radius_miles} miles")
+        _update_progress("Creating search area...", 0.05)
+        
+        # Step 1: Create bbox from lat/lon
+        center = (lat, lon)
+        bbox = create_search_bbox(center, radius_miles)
+        logger.info(f"Search bbox: {bbox}")
+        
+        _update_progress("Checking imagery availability...", 0.1)
+        
+        # Step 2: Check imagery date for cache validation
+        imagery_date = self.fetcher.get_imagery_date(bbox)
+        if imagery_date is None:
+            raise ValueError(f"No NAIP imagery available for this location ({lat:.4f}, {lon:.4f})")
+        
+        logger.info(f"NAIP imagery date: {imagery_date}")
+        _update_progress("Checking cache...", 0.15)
+        
+        # Step 3: Check cache
+        if not skip_cache:
+            cached = self.cache.get_cached(bbox, imagery_date)
+            if cached is not None:
+                logger.info(f"Cache hit: {len(cached)} courts")
+                _update_progress("Cache hit, finalizing results...", 1.0)
+                return self._cached_to_geojson_location(cached, lat, lon, location_name, radius_miles)
+        
+        # Step 4: Fetch imagery
+        logger.info("Fetching NAIP imagery...")
+        _update_progress("Fetching NAIP imagery from Planetary Computer...", 0.3)
+        naip_image = self.fetcher.fetch(bbox)
+        
+        # Step 5: Generate chips
+        _update_progress("Generating image chips...", 0.4)
+        chips = list(self.chip_generator.generate(
+            naip_image.data,
+            naip_image.transform,
+            naip_image.crs
+        ))
+        logger.info(f"Generated {len(chips)} image chips")
+        
+        # Step 6: Process chips with SAM 3
+        all_candidates = []
+        total_chips = len(chips)
+        
+        for i, chip in enumerate(chips):
+            step_desc = f"Processing chip {i+1}/{total_chips}..."
+            logger.debug(step_desc)
+            _update_progress(step_desc, 0.4 + (i / total_chips) * 0.5, i + 1, total_chips)
+            
+            # Run segmentation
+            results = self.segmenter.segment_with_text(
+                chip.rgb,
+                text_prompt=text_prompt
+            )
+            
+            if not results:
+                continue
+            
+            # Apply geometric filtering
+            valid_results = [r for r in results if r.polygon is not None]
+            
+            candidates = self.court_filter.filter_candidates(
+                polygons=[r.polygon for r in valid_results if r.polygon is not None],
+                masks=[r.mask for r in valid_results],
+                scores=[r.score for r in valid_results],
+                image=chip.rgb
+            )
+            
+            # Store with chip transform for world coordinate conversion
+            for candidate in candidates:
+                all_candidates.append((candidate, chip.pixel_to_world))
+        
+        _update_progress("Merging overlapping detections...", 0.95)
+        logger.info(f"Found {len(all_candidates)} candidates before NMS")
+        
+        # Step 7: NMS merge in world coordinates
+        merged = world_nms_merge(all_candidates, iou_threshold=0.5)
+        logger.info(f"After NMS: {len(merged)} courts")
+        
+        # Step 8: Convert to detections
+        _update_progress("Finalizing results...", 0.98)
+        detections = []
+        cached_courts = []
+        
+        for candidate in merged:
+            geojson_geom = mapping(candidate.polygon)
+            
+            detection = CourtDetection(
+                polygon_geojson=geojson_geom,
+                confidence=candidate.confidence,
+                area_m2=candidate.area_m2,
+                aspect_ratio=candidate.aspect_ratio
+            )
+            detections.append(detection)
+            
+            cached_courts.append(CachedCourt.from_polygon(
+                candidate.polygon,
+                candidate.confidence,
+                candidate.area_m2,
+                candidate.aspect_ratio
+            ))
+        
+        # Step 9: Cache results
+        self.cache.store(bbox, cached_courts, imagery_date)
+        
+        # Step 10: Return GeoJSON
+        return self._detections_to_geojson_location(
+            detections, lat, lon, location_name, radius_miles, imagery_date
+        )
+    
+    def _detections_to_geojson_location(
+        self,
+        detections: List[CourtDetection],
+        lat: float,
+        lon: float,
+        location_name: str,
+        radius_miles: float,
+        imagery_date: date
+    ) -> Dict[str, Any]:
+        """Convert detections to GeoJSON for location-based search."""
+        features = [d.to_feature() for d in detections]
+        
+        return {
+            "type": "FeatureCollection",
+            "features": features,
+            "properties": {
+                "center_lat": lat,
+                "center_lon": lon,
+                "location_name": location_name,
+                "radius_miles": radius_miles,
+                "imagery_date": imagery_date.isoformat(),
+                "court_count": len(features),
+                "generated_by": "court-finder"
+            }
+        }
+    
+    def _cached_to_geojson_location(
+        self,
+        cached: List[CachedCourt],
+        lat: float,
+        lon: float,
+        location_name: str,
+        radius_miles: float
+    ) -> Dict[str, Any]:
+        """Convert cached results to GeoJSON for location-based search."""
+        features = []
+        
+        for court in cached:
+            polygon = court.to_polygon()
+            feature = {
+                "type": "Feature",
+                "geometry": mapping(polygon),
+                "properties": {
+                    "confidence": court.confidence,
+                    "area_m2": round(court.area_m2, 1),
+                    "aspect_ratio": round(court.aspect_ratio, 2),
+                    "type": "tennis_court",
+                    "cached": True
+                }
+            }
+            features.append(feature)
+        
+        return {
+            "type": "FeatureCollection",
+            "features": features,
+            "properties": {
+                "center_lat": lat,
+                "center_lon": lon,
+                "location_name": location_name,
+                "radius_miles": radius_miles,
+                "court_count": len(features),
+                "from_cache": True,
+                "generated_by": "court-finder"
+            }
+        }
     
     def _detections_to_geojson(
         self,
